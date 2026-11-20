@@ -11,7 +11,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use xmrelay_core::{Actor, AgentAdapter, AgentId, EventKind, SessionFilter, SessionSummary};
+use xmrelay_core::{
+    Actor, AgentAdapter, AgentId, EventKind, SessionFilter, SessionSummary, TaskState,
+};
 
 /// RAII guard: leaves raw mode and shows the cursor on drop, so `?` errors,
 /// panics, and early returns can never leave the terminal wedged.
@@ -567,11 +569,15 @@ pub fn pick_handoff_history(store: &Path) -> Result<Option<String>, String> {
         .map(|m| {
             let rel = format_relative_time(&m.created_at);
             let proj = short_project_name(&m.project_root);
-            let summary = ho::validate_handoff(store, &m.handoff_id, None)
-                .ok()
-                .map(|d| clean_snippet(&d.task_state.objective, 48))
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| proj.clone());
+            // Read the packaged objective directly: a full validate per row
+            // would re-inspect the live repository once per stored handoff.
+            let summary =
+                std::fs::read_to_string(store.join(&m.handoff_id).join("task-state.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<TaskState>(&t).ok())
+                    .map(|ts| clean_snippet(&ts.objective, 48))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| proj.clone());
             format!(
                 "[{} → {}] {} — {} ({:?} · {})",
                 m.source_agent.as_str(),

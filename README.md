@@ -23,8 +23,8 @@ When you hit a usage limit or switch models across AI coding agents (**OpenCode*
 
 1. **Discovers & Normalizes Sessions** across `opencode`, `antigravity-cli`, and `omp` without ever modifying source session databases or files.
 2. **Inspects Live Git State** (branch, HEAD, staged/unstaged/untracked files, binary-safe diffs, and `AGENTS.md`/`CLAUDE.md` instructions) with `GIT_OPTIONAL_LOCKS=0` so `.git/index` is never mutated.
-3. **Verifies Claims Against Disk:** Checks whether files reported as created/modified in a session actually exist in the workspace. Missing files or branch/HEAD drift trigger critical conflicts that **block continuation**.
-4. **Redacts Secrets Automatically:** Scans transcripts, diffs, and project instructions for credentials (AWS, GitHub, Slack, Google, Stripe, `sk-` API keys, JWTs, private keys, URL credentials) and replaces them with `[REDACTED:<kind>]` before writing anything to disk.
+3. **Verifies Claims Against Disk:** Checks whether files reported as created/modified in a session actually exist in the workspace, records successful test/build/lint runs as verified evidence, and detects working-tree drift since the handoff snapshot. Missing files or branch/HEAD drift trigger critical conflicts that **block continuation**.
+4. **Redacts Secrets Automatically:** Scans transcripts, diffs, and project instructions for credentials (AWS, GitHub, Slack, Google, Stripe, `sk-` API keys, JWTs, private keys, URL credentials) and replaces them with `[REDACTED:<kind>]` before writing anything to disk. `handoff create` also content-scans untracked workspace files (never exported) and warns about live secrets plus sensitive file names (`*.env`, keys, credential stores) so nothing surprises the receiving agent.
 5. **Enforces Target-Agent Preflight:** Generates a structured handoff package (`manifest.json`, `context.md`, `task-state.json`, `evidence.json`, `checksums.txt`) and a preflight prompt that requires the receiving agent to verify the workspace before writing code.
 
 ---
@@ -136,7 +136,7 @@ Packages are stored in `~/.local/share/xmrelay/handoffs/<handoff-id>/` (or `$XDG
 ```text
 <handoff-id>/
 ├── manifest.json              # Metadata, Git summary, qualitative confidence, conflicts, file digests
-├── context.md                 # Structured summary: Objective, Completed, Pending, Failed, Conflicts
+├── context.md                 # Structured summary: Objective, Verification Runs, Completed, Pending, Failed, Conflicts
 ├── task-state.json            # Extracted tasks with status, confidence, and evidence_refs
 ├── evidence.json              # Provenance & verification results (verified / reported / conflict)
 ├── session-normalized.json    # Secret-redacted canonical session events and parse report

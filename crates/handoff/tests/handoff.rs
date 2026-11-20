@@ -508,3 +508,205 @@ fn context_accuracy_handles_in_session_rm_multiline_and_affirmative_reply() {
     let reval = validate_handoff(&store, &detail.manifest.handoff_id, Some(&repo)).unwrap();
     assert_eq!(reval.validation.status, PreflightStatus::Passed);
 }
+
+/// Recursively assert that no file under `dir` contains `needle`.
+fn assert_dir_lacks(dir: &Path, needle: &str) {
+    fn walk(p: &Path, needle: &str) {
+        if p.is_dir() {
+            for e in fs::read_dir(p).unwrap().flatten() {
+                walk(&e.path(), needle);
+            }
+        } else if let Ok(b) = fs::read(p) {
+            assert!(
+                !String::from_utf8_lossy(&b).contains(needle),
+                "unexpected secret in {}",
+                p.display()
+            );
+        }
+    }
+    walk(dir, needle);
+}
+
+#[test]
+fn untracked_secret_warns_without_exporting() {
+    let t = Tmp::new("untracked-secret");
+    let repo = t.0.join("repo");
+    let store = t.0.join("store");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("src/auth.rs"), "pub fn auth() {}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let token = format!("ghp_{}", "A".repeat(36));
+    fs::write(repo.join("config.env"), format!("GITHUB_TOKEN={token}\n")).unwrap();
+
+    let sess = sample_session(&repo, "src/auth.rs", "no-secret");
+    let detail = create_handoff(&sess, AgentId::Omp, Some(&repo), &store).unwrap();
+
+    assert!(detail
+        .validation
+        .warnings
+        .iter()
+        .any(|w| w.contains("potential secret in untracked file config.env:1")));
+    assert!(detail
+        .manifest
+        .sensitive_files
+        .iter()
+        .any(|s| s.path == "config.env"));
+    assert_eq!(
+        detail.validation.status,
+        PreflightStatus::PassedWithWarnings
+    );
+    let pkg = store.join(&detail.manifest.handoff_id);
+    assert_dir_lacks(&pkg, &token);
+}
+
+#[test]
+fn successful_check_runs_reach_context_and_evidence() {
+    let t = Tmp::new("check-runs");
+    let repo = t.0.join("repo");
+    let store = t.0.join("store");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("src/auth.rs"), "pub fn auth() {}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+
+    let mut sess = sample_session(&repo, "src/auth.rs", "no-secret");
+    sess.events.push(Event {
+        id: "e4".into(),
+        sequence: 4,
+        timestamp: None,
+        kind: EventKind::ToolResult,
+        actor: Actor::Tool,
+        content: EventContent::default(),
+        tool: Some(ToolInfo {
+            name: "bash".into(),
+            input: Some(json!({ "command": "cargo test" })),
+            output: Some("ok. 3 passed".into()),
+        }),
+        status: ToolStatus::Succeeded,
+        source_ref: EventSourceRef {
+            session_id: "ses_demo".into(),
+            native_event_id: Some("t3".into()),
+        },
+        parse_status: ParseStatus::Parsed,
+    });
+    let detail = create_handoff(&sess, AgentId::Omp, Some(&repo), &store).unwrap();
+
+    assert!(detail.context_md.contains("## Verification Runs"));
+    assert!(detail.context_md.contains("cargo test (passed"));
+    assert!(detail.evidence.items.iter().any(|i| i
+        .claim
+        .contains("Verification run passed in session: cargo test")
+        && i.classification == Classification::Verified));
+}
+
+#[test]
+fn validate_warns_when_tracked_tree_drifts_after_creation() {
+    let t = Tmp::new("drift");
+    let repo = t.0.join("repo");
+    let store = t.0.join("store");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("src/auth.rs"), "pub fn auth() {}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+
+    let sess = sample_session(&repo, "src/auth.rs", "no-secret");
+    let detail = create_handoff(&sess, AgentId::Omp, Some(&repo), &store).unwrap();
+
+    // Edit a tracked file after the handoff snapshot: branch/HEAD unchanged,
+    // file still exists; only the patch digest can reveal the drift.
+    fs::write(repo.join("src/auth.rs"), "pub fn auth() { changed }\n").unwrap();
+    let reval = validate_handoff(&store, &detail.manifest.handoff_id, Some(&repo)).unwrap();
+    assert!(reval.validation.conflicts.iter().all(|c| !c.critical));
+    assert!(reval
+        .validation
+        .warnings
+        .iter()
+        .any(|w| w.contains("differ from the handoff snapshot")));
+}
+
+#[test]
+fn missing_project_root_blocks_create() {
+    let t = Tmp::new("missing-root");
+    let ghost = t.0.join("ghost");
+    let store = t.0.join("store");
+
+    let mut sess = sample_session(&ghost, "src/none.rs", "no-secret");
+    sess.events.retain(|e| e.kind == EventKind::UserMessage);
+    let detail = create_handoff(&sess, AgentId::Omp, Some(&ghost), &store).unwrap();
+
+    assert_eq!(detail.validation.status, PreflightStatus::Blocked);
+    assert!(detail
+        .validation
+        .checklist
+        .iter()
+        .any(|c| c.id == "CHK-01" && !c.checked));
+}
+
+#[test]
+fn user_message_noise_filtered_and_deduped() {
+    let t = Tmp::new("user-noise");
+    let repo = t.0.join("repo");
+    let store = t.0.join("store");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("src/auth.rs"), "pub fn auth() {}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+
+    let mut sess = sample_session(&repo, "src/auth.rs", "no-secret");
+    let user_events: Vec<Event> = ["e1", "e2", "e3"]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| Event {
+            id: (*id).into(),
+            sequence: i as u64 + 1,
+            timestamp: None,
+            kind: EventKind::UserMessage,
+            actor: Actor::User,
+            content: EventContent {
+                text: Some(match *id {
+                    "e1" => {
+                        "<system-reminder>session context refreshed</system-reminder>\nperbaiki bug login di halaman auth"
+                    }
+                    "e2" => "perbaiki bug login di halaman auth",
+                    _ => "[Request interrupted by user]",
+                }
+                .into()),
+                structured: None,
+            },
+            tool: None,
+            status: ToolStatus::Unknown,
+            source_ref: EventSourceRef {
+                session_id: "ses_demo".into(),
+                native_event_id: Some((*id).into()),
+            },
+            parse_status: ParseStatus::Parsed,
+        })
+        .collect();
+    sess.events = user_events;
+    sess.parse_report.total_events = 3;
+    sess.parse_report.parsed_events = 3;
+
+    let detail = create_handoff(&sess, AgentId::Omp, Some(&repo), &store).unwrap();
+
+    assert_eq!(
+        detail.task_state.objective,
+        "perbaiki bug login di halaman auth"
+    );
+    assert!(!detail.context_md.to_lowercase().contains("system-reminder"));
+    assert!(!detail.context_md.contains("[Request interrupted"));
+    let section = detail
+        .context_md
+        .split("## User Requirements\n")
+        .nth(1)
+        .unwrap()
+        .split("\n\n")
+        .next()
+        .unwrap();
+    let bullets = section.lines().filter(|l| l.starts_with("- ")).count();
+    assert_eq!(bullets, 1);
+}

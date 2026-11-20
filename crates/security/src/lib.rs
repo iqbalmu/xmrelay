@@ -314,37 +314,39 @@ pub fn sensitive_file(path: &str) -> Option<SensitiveFile> {
         .next()
         .unwrap_or(&normalized)
         .to_ascii_lowercase();
-    let reason =
-        if name == ".env" || name == ".envrc" || (name.starts_with(".env.") && !is_template(&name))
-        {
-            "environment file"
-        } else if matches!(
-            name.as_str(),
-            "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519" | "id_ed25519_sk"
-        ) {
-            "ssh private key"
-        } else if [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"]
-            .iter()
-            .any(|e| name.ends_with(e))
-        {
-            "key or certificate store"
-        } else if matches!(
-            name.as_str(),
-            ".netrc"
-                | ".pgpass"
-                | ".npmrc"
-                | ".pypirc"
-                | "credentials"
-                | "credentials.json"
-                | "secrets.json"
-                | "service-account.json"
-        ) {
-            "credentials file"
-        } else if name.starts_with("secrets.") || name.starts_with("secret.") {
-            "secrets file"
-        } else {
-            return None;
-        };
+    let reason = if name == ".env"
+        || name == ".envrc"
+        || (name.starts_with(".env.") && !is_template(&name))
+        || (name.ends_with(".env") && !is_template(&name))
+    {
+        "environment file"
+    } else if matches!(
+        name.as_str(),
+        "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519" | "id_ed25519_sk"
+    ) {
+        "ssh private key"
+    } else if [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"]
+        .iter()
+        .any(|e| name.ends_with(e))
+    {
+        "key or certificate store"
+    } else if matches!(
+        name.as_str(),
+        ".netrc"
+            | ".pgpass"
+            | ".npmrc"
+            | ".pypirc"
+            | "credentials"
+            | "credentials.json"
+            | "secrets.json"
+            | "service-account.json"
+    ) {
+        "credentials file"
+    } else if name.starts_with("secrets.") || name.starts_with("secret.") {
+        "secrets file"
+    } else {
+        return None;
+    };
     Some(SensitiveFile {
         path: path.into(),
         reason: reason.to_string(),
@@ -500,6 +502,8 @@ mod tests {
         for p in [
             ".env",
             "app/.env.local",
+            "config.env",
+            "deploy/prod.env",
             "id_rsa",
             "certs/server.pem",
             "k.key",
@@ -512,6 +516,7 @@ mod tests {
         for p in [
             ".env.example",
             ".env.sample",
+            "config.env.example",
             "src/main.rs",
             "README.md",
             "monkey.txt",

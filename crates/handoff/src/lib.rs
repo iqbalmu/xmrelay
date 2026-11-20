@@ -22,7 +22,7 @@ use xmrelay_repository::{
     discover_instructions, inspect, redact_free_text, sha256_hex, tracked_patch, InstructionSet,
     RepoError, RepositoryState,
 };
-use xmrelay_security::{redact_bytes, redact_text, sensitive_file, SensitiveFile};
+use xmrelay_security::{redact_bytes, redact_text, scan_text, sensitive_file, SensitiveFile};
 
 pub const SCHEMA_VERSION: &str = "1.0";
 
@@ -276,6 +276,10 @@ struct Extracted {
     failed_attempts: Vec<String>,
     known_issues: Vec<String>,
     uncertainties: Vec<String>,
+    /// Successful test/build/lint commands run in the session.
+    check_runs: Vec<String>,
+    /// Human-readable session time range and event count for staleness context.
+    session_window: String,
 }
 
 fn truncate_line(s: &str, max: usize) -> String {
@@ -336,6 +340,69 @@ fn is_short_affirmative(s: &str) -> bool {
             | "do it"
             | "continue"
     )
+}
+
+/// Strip agent-injected boilerplate from user text so objectives and
+/// requirement lists keep the human's actual words: `<system-reminder>`-style
+/// blocks and `[Request interrupted ...]` markers. An unclosed reminder block
+/// drops the rest of the text (fail safe) rather than exporting it as intent.
+fn strip_user_noise(s: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        match lower.find(OPEN) {
+            Some(start) => {
+                out.push_str(&rest[..start]);
+                match lower[start..].find(CLOSE) {
+                    Some(rel) => rest = &rest[start + rel + CLOSE.len()..],
+                    None => break,
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out.lines()
+        .filter(|l| {
+            !l.trim()
+                .to_ascii_lowercase()
+                .starts_with("[request interrupted")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Commands whose successful execution is strong continuation evidence
+/// (tests, builds, linters). Matched on whole command tokens so merely
+/// reading a file named `test.py` or `ls build` does not qualify.
+fn is_check_command(cmd: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "test",
+        "tests",
+        "pytest",
+        "jest",
+        "vitest",
+        "mocha",
+        "playwright",
+        "build",
+        "clippy",
+        "lint",
+        "eslint",
+        "ruff",
+        "tsc",
+        "fmt",
+        "check",
+        "golangci-lint",
+        "verify",
+        "compile",
+    ];
+    cmd.split_whitespace()
+        .any(|tok| tok.split(':').any(|part| MARKERS.contains(&part)))
 }
 
 fn was_deleted_in_session_after(
@@ -495,11 +562,16 @@ fn extract_from_session(
         if ev.kind == EventKind::UserMessage {
             if let Some(t) = &ev.content.text {
                 let (clean, _) = redact_text(t);
-                let trimmed = clean.trim();
+                let cleaned = strip_user_noise(&clean);
+                let trimmed = cleaned.trim();
                 if !trimmed.is_empty() {
                     let collapsed = collapse_text(trimmed, 240);
-                    user_reqs.push(collapsed.clone());
-                    user_req_indices.push((idx, collapsed));
+                    // Retries re-send the same text; keep one copy so the
+                    // requirement list stays about distinct requests.
+                    if user_reqs.last().map(String::as_str) != Some(collapsed.as_str()) {
+                        user_reqs.push(collapsed.clone());
+                        user_req_indices.push((idx, collapsed));
+                    }
                 }
             }
         } else if ev.kind == EventKind::AssistantMessage {
@@ -529,6 +601,7 @@ fn extract_from_session(
     let mut known_issues: Vec<String> = Vec::new();
     let mut uncertainties: Vec<String> = Vec::new();
     let mut assistant_notes: Vec<String> = Vec::new();
+    let mut check_runs: Vec<String> = Vec::new();
 
     // Check session project root vs live project root
     if let Some(sp) = &session.project {
@@ -787,6 +860,41 @@ fn extract_from_session(
                         ev.id
                     ));
                 }
+                ToolStatus::Succeeded
+                    if matches!(tool_name, "bash" | "run_command" | "shell" | "sh")
+                        && !raw_input_str.is_empty()
+                        && is_check_command(raw_input_str) =>
+                {
+                    // A passing test/build/lint run is exactly the evidence a
+                    // receiving agent needs before continuing; record it.
+                    let cmd = truncate_line(&redact_text(raw_input_str).0, 80);
+                    let out_first = ev
+                        .tool
+                        .as_ref()
+                        .and_then(|t| t.output.as_deref())
+                        .map(|o| truncate_line(&redact_text(o).0, 60))
+                        .unwrap_or_default();
+                    check_runs.push(if out_first.is_empty() {
+                        format!("{cmd} (passed)")
+                    } else {
+                        format!("{cmd} (passed: {out_first})")
+                    });
+                    evidence.push(EvidenceItem {
+                        id: format!("E-{:03}", evidence.len() + 1),
+                        claim: format!("Verification run passed in session: {cmd}"),
+                        classification: Classification::Verified,
+                        source_type: SourceType::Tool,
+                        source_ref: SourceRef {
+                            session_id: Some(session.id.clone()),
+                            event_id: Some(ev.id.clone()),
+                            ..Default::default()
+                        },
+                        verification: Verification {
+                            method: "tool_result_status".into(),
+                            result: "passed".into(),
+                        },
+                    });
+                }
                 _ => {}
             }
         } else if ev.kind == EventKind::Error {
@@ -940,6 +1048,19 @@ fn extract_from_session(
         });
     }
 
+    // Keep the last few check runs only; older repeats add noise, not context.
+    let check_start = check_runs.len().saturating_sub(10);
+    let check_runs = check_runs.split_off(check_start);
+    let session_window = {
+        let n = session.events.len();
+        match (session.started_at.as_deref(), session.updated_at.as_deref()) {
+            (Some(s), Some(u)) if s == u => format!("{s} ({n} events)"),
+            (Some(s), Some(u)) => format!("{s} -> {u} ({n} events)"),
+            (Some(t), None) | (None, Some(t)) => format!("{t} ({n} events)"),
+            (None, None) => format!("{n} events"),
+        }
+    };
+
     Extracted {
         objective,
         user_reqs,
@@ -950,6 +1071,8 @@ fn extract_from_session(
         failed_attempts,
         known_issues,
         uncertainties,
+        check_runs,
+        session_window,
     }
 }
 
@@ -1036,10 +1159,12 @@ fn render_context_md(
     let mut out = String::new();
     out.push_str("# Handoff Context\n\n");
     out.push_str(&format!(
-        "- **Handoff ID:** `{}`\n- **Source Agent:** `{}` (session `{}`)\n- **Target Agent:** `{}`\n- **Project Root:** `{}`\n- **Git Branch / HEAD:** `{}` @ `{}` (dirty: `{}`)\n- **Overall Confidence:** `{:?}` ({})\n\n",
+        "- **Handoff ID:** `{}`\n- **Created:** `{}`\n- **Source Agent:** `{}` (session `{}`, {})\n- **Target Agent:** `{}`\n- **Project Root:** `{}`\n- **Git Branch / HEAD:** `{}` @ `{}` (dirty: `{}`)\n- **Overall Confidence:** `{:?}` ({})\n\n",
         manifest.handoff_id,
+        manifest.created_at,
         manifest.source_agent.as_str(),
         manifest.source_session_id,
+        ext.session_window,
         manifest.target_agent.as_str(),
         manifest.project_root,
         manifest.git.branch.as_deref().unwrap_or("(none)"),
@@ -1120,6 +1245,18 @@ fn render_context_md(
                 t.confidence,
                 t.evidence_refs.join(", ")
             ));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Verification Runs\n");
+    if ext.check_runs.is_empty() {
+        out.push_str(
+            "- No test/build/lint command succeeded in this session; treat untested work as unverified.\n\n",
+        );
+    } else {
+        for c in &ext.check_runs {
+            out.push_str(&format!("- {c}\n"));
         }
         out.push('\n');
     }
@@ -1321,6 +1458,42 @@ pub fn create_handoff(
             s.path, s.reason
         ));
     }
+    // Content-scan untracked files for secrets: they are never exported, but
+    // the receiving agent keeps working in this workspace, so live secrets
+    // must surface as warnings. Values and file contents stay out of the
+    // package; only path, line, kind, and fingerprint are recorded.
+    const MAX_UNTRACKED_SCAN_BYTES: u64 = 5 * 1024 * 1024;
+    for f in &repo_state.untracked {
+        let Some(size) = f.size else {
+            continue;
+        };
+        if f.is_symlink || size > MAX_UNTRACKED_SCAN_BYTES {
+            continue;
+        }
+        let Ok(text) = fs::read(root_path.join(&f.path))
+            .map_err(|e| e.to_string())
+            .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()))
+        else {
+            continue;
+        };
+        let hits = scan_text(&text);
+        for hit in hits.iter().take(3) {
+            warnings.push(format!(
+                "potential secret in untracked file {}:{} ({}) [{}] (file not exported)",
+                f.path,
+                hit.line,
+                hit.kind.as_str(),
+                hit.fingerprint
+            ));
+        }
+        if hits.len() > 3 {
+            warnings.push(format!(
+                "and {} more finding(s) in untracked file {} (file not exported)",
+                hits.len() - 3,
+                f.path
+            ));
+        }
+    }
     warnings.extend(ext.uncertainties.iter().cloned());
 
     let (overall_conf, conf_reason) = if ext.conflicts.iter().any(|c| c.critical) {
@@ -1437,8 +1610,9 @@ pub fn create_handoff(
     }
 
     let checklist = build_checklist(&manifest, &repo_state, &task_state, true);
-    let status = if !checklist.iter().all(|c| c.checked) && ext.conflicts.iter().any(|c| c.critical)
-    {
+    let status = if checklist.iter().any(|c| !c.checked) {
+        // Any unchecked item is a blocker: a missing project root or
+        // unresolved critical conflict both make continuation unsafe.
         PreflightStatus::Blocked
     } else if !warnings.is_empty() {
         PreflightStatus::PassedWithWarnings
@@ -1604,6 +1778,28 @@ pub fn validate_handoff(
                 ),
                 evidence_ref: None,
             });
+        }
+    }
+
+    // Working-tree drift: compare the packaged tracked patch with the live
+    // one (same truncation + redaction pipeline) so edits made after the
+    // handoff was created surface even when branch/HEAD and file existence
+    // still match. Best-effort: a failing diff command is skipped, not fatal.
+    if manifest.git.is_repository && live_repo.is_repository {
+        if let (Ok(packaged), Ok(mut live_raw)) = (
+            fs::read(dir.join("patches/working-tree.patch")),
+            tracked_patch(&live_root),
+        ) {
+            if live_raw.len() > xmrelay_repository::MAX_PATCH_BYTES {
+                live_raw.truncate(xmrelay_repository::MAX_PATCH_BYTES);
+            }
+            let (live_redacted, _) = redact_bytes(&live_raw);
+            if sha256_hex(&packaged) != sha256_hex(&live_redacted) {
+                warnings.push(
+                    "tracked working-tree changes differ from the handoff snapshot; files changed after the handoff was created"
+                        .into(),
+                );
+            }
         }
     }
 
