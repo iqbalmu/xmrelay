@@ -106,6 +106,15 @@ fn reports_unsupported_orphans_truncation_and_bad_json() {
         .events
         .iter()
         .any(|e| e.kind == EventKind::AssistantMessage && e.parse_status == ParseStatus::Partial));
+    // partial_events counts events exactly once (push-time and the
+    // truncated_fields re-marking must not double-count)
+    let partial_marker_count = s
+        .events
+        .iter()
+        .filter(|e| e.parse_status == ParseStatus::Partial)
+        .count() as u64;
+    assert_eq!(s.parse_report.partial_events, partial_marker_count);
+    assert!(s.parse_report.partial_events <= s.parse_report.parsed_events);
     let _ = std::fs::remove_file(db);
 }
 

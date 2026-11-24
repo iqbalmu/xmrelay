@@ -1726,7 +1726,10 @@ pub fn validate_handoff(
     let live_root = live_project_override
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(&manifest.project_root));
-    let live_repo = inspect(&live_root)?;
+    let mut live_repo = inspect(&live_root)?;
+    // Redact live free text like the stored side: a secret-bearing branch
+    // name must neither force a false branch conflict nor reach the report.
+    xmrelay_repository::redact_free_text(&mut live_repo);
 
     let mut conflicts = manifest.conflicts.clone();
     let mut warnings = manifest.warnings.clone();

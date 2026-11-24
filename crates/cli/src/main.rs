@@ -224,6 +224,7 @@ enum SessionsCommand {
     },
     /// Search sessions by keyword (defaults to active project directory; pass -g/--global for all).
     /// Scans the 200 newest sessions per adapter; older sessions are not searched.
+    /// Matches session ids, titles, and project paths only; message content is not searched.
     Search {
         query: String,
         #[arg(long)]
@@ -569,68 +570,75 @@ struct ScanHit {
 fn project_scan(path: Option<std::path::PathBuf>, json: bool) -> Result<bool, String> {
     let path = path.unwrap_or_else(|| std::path::PathBuf::from("."));
     let st = repo::inspect(&path).map_err(|e| e.to_string())?;
-    let root = std::path::PathBuf::from(st.root.clone().ok_or("not inside a Git repository")?);
     let mut hits: Vec<ScanHit> = Vec::new();
     let mut scanned = 0usize;
     let mut skipped = 0usize;
+    let mut non_repo_note = false;
 
-    let mut names: Vec<&str> = st.untracked.iter().map(|f| f.path.as_str()).collect();
-    names.extend(
-        st.staged
-            .iter()
-            .chain(&st.unstaged)
-            .map(|f| f.path.as_str()),
-    );
-    names.sort();
-    names.dedup();
-    for n in names {
-        if let Some(s) = sec::sensitive_file(n) {
-            hits.push(ScanHit {
-                location: n.into(),
-                what: format!("sensitive file name ({})", s.reason),
-                line: None,
-                fingerprint: None,
-            });
+    // Untracked files and the tracked diff only exist inside a repository;
+    // outside one, degrade to instruction scanning (like `project inspect`)
+    // instead of erroring.
+    if let Some(root) = st.root.clone().map(std::path::PathBuf::from) {
+        let mut names: Vec<&str> = st.untracked.iter().map(|f| f.path.as_str()).collect();
+        names.extend(
+            st.staged
+                .iter()
+                .chain(&st.unstaged)
+                .map(|f| f.path.as_str()),
+        );
+        names.sort();
+        names.dedup();
+        for n in names {
+            if let Some(s) = sec::sensitive_file(n) {
+                hits.push(ScanHit {
+                    location: n.into(),
+                    what: format!("sensitive file name ({})", s.reason),
+                    line: None,
+                    fingerprint: None,
+                });
+            }
         }
-    }
-    for f in &st.untracked {
-        let Some(size) = f.size else {
-            skipped += 1;
-            continue;
-        };
-        if f.is_symlink || size > 5 * 1024 * 1024 {
-            skipped += 1;
-            continue;
+        for f in &st.untracked {
+            let Some(size) = f.size else {
+                skipped += 1;
+                continue;
+            };
+            if f.is_symlink || size > 5 * 1024 * 1024 {
+                skipped += 1;
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(root.join(&f.path)) else {
+                skipped += 1;
+                continue;
+            };
+            let Ok(text) = String::from_utf8(bytes) else {
+                skipped += 1;
+                continue;
+            };
+            scanned += 1;
+            for x in sec::scan_text(&text) {
+                hits.push(ScanHit {
+                    location: f.path.clone(),
+                    what: x.kind.as_str().into(),
+                    line: Some(x.line),
+                    fingerprint: Some(x.fingerprint),
+                });
+            }
         }
-        let Ok(bytes) = std::fs::read(root.join(&f.path)) else {
-            skipped += 1;
-            continue;
-        };
-        let Ok(text) = String::from_utf8(bytes) else {
-            skipped += 1;
-            continue;
-        };
+        let patch = repo::tracked_patch(&root).map_err(|e| e.to_string())?;
         scanned += 1;
-        for x in sec::scan_text(&text) {
+        for x in sec::scan_patch(&String::from_utf8_lossy(&patch)) {
             hits.push(ScanHit {
-                location: f.path.clone(),
-                what: x.kind.as_str().into(),
-                line: Some(x.line),
-                fingerprint: Some(x.fingerprint),
+                location: format!("{} (added lines in tracked diff)", x.path),
+                what: x.finding.kind.as_str().into(),
+                line: None,
+                fingerprint: Some(x.finding.fingerprint),
             });
         }
+    } else {
+        non_repo_note = true;
     }
-    let patch = repo::tracked_patch(&root).map_err(|e| e.to_string())?;
-    scanned += 1;
-    for x in sec::scan_patch(&String::from_utf8_lossy(&patch)) {
-        hits.push(ScanHit {
-            location: format!("{} (added lines in tracked diff)", x.path),
-            what: x.finding.kind.as_str().into(),
-            line: None,
-            fingerprint: Some(x.finding.fingerprint),
-        });
-    }
-    for f in repo::discover_instructions(&root).files {
+    for f in repo::discover_instructions(&path).files {
         if let Some(text) = &f.content {
             scanned += 1;
             for x in sec::scan_text(text) {
@@ -660,6 +668,12 @@ fn project_scan(path: Option<std::path::PathBuf>, json: bool) -> Result<bool, St
                     .as_ref()
                     .map(|f| format!("  [{f}]"))
                     .unwrap_or_default()
+            );
+        }
+        if non_repo_note {
+            println!(
+                "note: {} is not inside a Git repository; instruction files scanned only",
+                path.display()
             );
         }
         println!(
@@ -1041,6 +1055,11 @@ fn search_sessions(
     }
     matches.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     matches.truncate(limit);
+    if matches.is_empty() && !json {
+        eprintln!(
+            "note: search matches session ids, titles, and project paths only (not message content)"
+        );
+    }
     if json {
         #[derive(serde::Serialize)]
         struct Row {

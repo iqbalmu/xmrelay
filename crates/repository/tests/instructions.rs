@@ -93,3 +93,30 @@ fn empty_project_yields_empty_set() {
     assert!(s.files.is_empty() && s.warnings.is_empty());
     fs::remove_dir_all(&r).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn fifo_instruction_file_does_not_hang_discovery() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("xmr-fifo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A stray FIFO named like an instruction file: discovery must warn and
+    // move on, never block in open(2) waiting for a writer.
+    let fifo = dir.join("AGENTS.md");
+    let ok = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no mkfifo on this platform; nothing to regression-test
+    }
+    let set = discover_instructions(&dir);
+    assert!(set
+        .warnings
+        .iter()
+        .any(|w| w.contains("AGENTS.md") && w.contains("not a regular file")));
+    let _ = std::fs::remove_dir_all(&dir);
+}

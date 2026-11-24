@@ -186,12 +186,14 @@ fn git_command(dir: &Path, args: &[&str]) -> Command {
 }
 
 /// Read a child pipe to EOF (or `cap` bytes), publishing the running length so
-/// the supervisor can detect a hit cap without joining.
+/// the supervisor can detect a hit cap without joining. A read error is
+/// returned alongside the partial buffer so callers never mistake truncated
+/// output for the complete stream.
 fn drain(
     rd: Option<impl Read + Send + 'static>,
     cap: Option<u64>,
     count: Arc<AtomicUsize>,
-) -> std::thread::JoinHandle<Vec<u8>> {
+) -> std::thread::JoinHandle<(std::io::Result<()>, Vec<u8>)> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let Some(mut rd) = rd else { return buf };
@@ -199,14 +201,15 @@ fn drain(
         let mut limited = (&mut rd).take(cap.unwrap_or(u64::MAX));
         loop {
             match limited.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     count.store(buf.len(), Ordering::Relaxed);
                 }
+                Err(e) => return (Err(e), buf),
             }
         }
-        buf
+        (Ok(()), buf)
     })
 }
 
@@ -236,9 +239,10 @@ fn run_git(
             .map_err(|e| RepoError::GitUnavailable(e.to_string()))?
         {
             Some(status) => {
-                let stdout = out_thread.join().unwrap_or_default();
-                let stderr = err_thread.join().unwrap_or_default();
+                let (out_res, stdout) = join_drained(out_thread);
+                let (_, stderr) = join_drained(err_thread);
                 if status.success() {
+                    out_res.map_err(pipe_err)?;
                     return Ok((stdout, stderr, false));
                 }
                 return Err(RepoError::GitFailed {
@@ -252,8 +256,9 @@ fn run_git(
                 if stdout_cap.is_some_and(|cap| out_count.load(Ordering::Relaxed) >= cap as usize) {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let stdout = out_thread.join().unwrap_or_default();
-                    let stderr = err_thread.join().unwrap_or_default();
+                    let (out_res, stdout) = join_drained(out_thread);
+                    let (_, stderr) = join_drained(err_thread);
+                    out_res.map_err(pipe_err)?;
                     return Ok((stdout, stderr, true));
                 }
                 if Instant::now() >= deadline {

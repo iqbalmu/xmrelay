@@ -109,13 +109,22 @@ impl AgentAdapter for OmpAdapter {
             // The file name is the lookup key (`find`): derive the id from it
             // when the header agrees, and skip the file entirely when it does
             // not (read_session refuses it, so listing it would strand the
-            // session behind a "not found" error).
+            // session behind a "not found" error). A name without an `_id`
+            // part (renamed, or not UTF-8) can never be resolved by `find`
+            // either, so it is skipped up front.
             let name_id = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".jsonl"))
                 .and_then(|stem| stem.rsplit_once('_'))
                 .map(|(_, id)| id.to_string());
+            if name_id.is_none() {
+                eprintln!(
+                    "xmrelay: warning: skipping session file whose name carries no id: {}",
+                    path.display()
+                );
+                continue;
+            }
             let (mut id, mut cwd, mut title, mut updated, mut count) =
                 (None, None, None, None, 0u64);
             let mut header_mismatch = false;

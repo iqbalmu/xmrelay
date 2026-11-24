@@ -476,8 +476,13 @@ impl Builder {
 
         if truncated {
             for e in &mut self.events[before..] {
-                e.parse_status = ParseStatus::Partial;
-                self.report.partial_events += 1;
+                // Count only the transition: events already pushed as Partial
+                // (SYSTEM_MESSAGE, unmatched tool results) were counted at
+                // push time and must not be double-counted here.
+                if e.parse_status != ParseStatus::Partial {
+                    e.parse_status = ParseStatus::Partial;
+                    self.report.partial_events += 1;
+                }
             }
             self.report.errors.push(format!(
                 "step {index}: fields truncated in source ({})",

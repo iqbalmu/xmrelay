@@ -745,3 +745,40 @@ fn validate_blocks_when_git_repository_disappears() {
         .iter()
         .any(|c| c.id == "CHK-03" && !c.checked));
 }
+
+#[test]
+fn validate_does_not_flag_or_leak_secret_branch_names() {
+    let t = Tmp::new("branch-secret");
+    let repo = t.0.join("repo");
+    let store = t.0.join("store");
+    fs::create_dir_all(&repo).unwrap();
+    // Branch name is itself an AWS access key: both sides get redacted, so
+    // re-validating an unchanged workspace must stay conflict-free and must
+    // never print the raw key.
+    let key = format!("AKIA{}", "ABCDEFGHIJKLMNOP");
+    git(&repo, &["init", "-q", "-b", &key]);
+    fs::write(repo.join("a.txt"), "hello\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+
+    let sess = sample_session(&repo, "a.txt", "no-secret");
+    let detail = create_handoff(&sess, AgentId::Omp, Some(&repo), &store).unwrap();
+    let reval = validate_handoff(&store, &detail.manifest.handoff_id, Some(&repo)).unwrap();
+    assert!(reval
+        .validation
+        .conflicts
+        .iter()
+        .all(|c| !c.description.contains(&key)));
+    assert!(!format!("{:?}", reval.validation).contains(&key));
+    let branch_conflicts: Vec<_> = reval
+        .validation
+        .conflicts
+        .iter()
+        .filter(|c| c.description.contains("branch"))
+        .collect();
+    assert!(
+        branch_conflicts.is_empty(),
+        "unchanged secret-named branch must not conflict: {:?}",
+        branch_conflicts
+    );
+}

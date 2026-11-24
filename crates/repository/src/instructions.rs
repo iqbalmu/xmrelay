@@ -183,6 +183,11 @@ fn read_file(
     if f.is_symlink {
         set.warnings
             .push(format!("{path} is a symlink and was not followed"));
+    } else if !meta.is_file() {
+        // Check the type from the path stat BEFORE opening: opening a FIFO
+        // (or other special file) for reading blocks until a writer appears,
+        // and no timeout covers plain fs operations here.
+        set.warnings.push(format!("{path} is not a regular file"));
     } else {
         // Open first and stat the descriptor: size, truncation flag, hash, and
         // exported bytes must all describe the same file even if the path is

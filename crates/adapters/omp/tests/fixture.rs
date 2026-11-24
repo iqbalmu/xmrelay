@@ -225,3 +225,21 @@ fn renamed_session_file_is_not_listed_under_its_header_id() {
     assert!(l.is_empty(), "renamed file must not be listed");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn session_file_without_name_id_is_not_listed() {
+    let dir = std::env::temp_dir().join(format!("xmr-omp-noid-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("-work-demo")).unwrap();
+    // No `<timestamp>_<id>` shape: `find` can never resolve the header id,
+    // so the file must not be listed at all.
+    std::fs::write(
+        dir.join("-work-demo/session.jsonl"),
+        "{\"type\":\"session\",\"version\":3,\"id\":\"cccc3333-0000-0000-0000-000000000003\",\"timestamp\":\"2023-11-14T22:00:00.000Z\",\"cwd\":\"/work/demo\"}\n",
+    )
+    .unwrap();
+    let a = OmpAdapter::new(dir.clone());
+    let l = a.list_sessions(&SessionFilter::default()).unwrap();
+    assert!(l.is_empty(), "file without a name id must not be listed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
