@@ -196,7 +196,9 @@ fn drain(
 ) -> std::thread::JoinHandle<(std::io::Result<()>, Vec<u8>)> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let Some(mut rd) = rd else { return buf };
+        let Some(mut rd) = rd else {
+            return (Ok(()), buf);
+        };
         let mut chunk = [0u8; 64 * 1024];
         let mut limited = (&mut rd).take(cap.unwrap_or(u64::MAX));
         loop {
@@ -273,6 +275,21 @@ fn run_git(
             }
         }
     }
+}
+
+fn join_drained(
+    h: std::thread::JoinHandle<(std::io::Result<()>, Vec<u8>)>,
+) -> (std::io::Result<()>, Vec<u8>) {
+    h.join().unwrap_or_else(|_| {
+        (
+            Err(std::io::Error::other("git output reader died")),
+            Vec::new(),
+        )
+    })
+}
+
+fn pipe_err(e: std::io::Error) -> RepoError {
+    RepoError::GitUnavailable(format!("reading git output: {e}"))
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, RepoError> {
