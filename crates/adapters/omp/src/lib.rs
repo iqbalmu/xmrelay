@@ -106,15 +106,31 @@ impl AgentAdapter for OmpAdapter {
                 );
                 continue;
             };
+            // The file name is the lookup key (`find`): derive the id from it
+            // when the header agrees, and skip the file entirely when it does
+            // not (read_session refuses it, so listing it would strand the
+            // session behind a "not found" error).
+            let name_id = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".jsonl"))
+                .and_then(|stem| stem.rsplit_once('_'))
+                .map(|(_, id)| id.to_string());
             let (mut id, mut cwd, mut title, mut updated, mut count) =
                 (None, None, None, None, 0u64);
+            let mut header_mismatch = false;
             for line in BufReader::new(f).lines().map_while(Result::ok) {
                 let Ok(v) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
                 match v["type"].as_str() {
                     Some("session") => {
-                        id = v["id"].as_str().map(String::from);
+                        if let (Some(n), Some(h)) = (&name_id, v["id"].as_str()) {
+                            if n != h {
+                                header_mismatch = true;
+                            }
+                        }
+                        id = v["id"].as_str().map(String::from).or(name_id.clone());
                         cwd = v["cwd"].as_str().map(String::from);
                         title = v["title"].as_str().map(String::from).or(title);
                     }
@@ -127,6 +143,13 @@ impl AgentAdapter for OmpAdapter {
                 if let Some(t) = v["timestamp"].as_str() {
                     updated = Some(t.to_string());
                 }
+            }
+            if header_mismatch {
+                eprintln!(
+                    "xmrelay: warning: skipping session file whose header id does not match its file name: {}",
+                    path.display()
+                );
+                continue;
             }
             let Some(id) = id else { continue };
             if !filter.matches_project(cwd.as_deref()) {

@@ -207,3 +207,21 @@ fn partial_events_are_counted_without_flagging_lossy() {
         "partial content is exported, not skipped"
     );
 }
+
+#[test]
+fn renamed_session_file_is_not_listed_under_its_header_id() {
+    let dir = std::env::temp_dir().join(format!("xmr-omp-listskip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("-work-demo")).unwrap();
+    std::fs::write(
+        dir.join("-work-demo/2023-11-14T22-00-00-000Z_bbbb2222-0000-0000-0000-000000000002.jsonl"),
+        "{\"type\":\"session\",\"version\":3,\"id\":\"aaaa1111-0000-0000-0000-000000000001\",\"timestamp\":\"2023-11-14T22:00:00.000Z\",\"cwd\":\"/work/demo\"}\n",
+    )
+    .unwrap();
+    let a = OmpAdapter::new(dir.clone());
+    let l = a.list_sessions(&SessionFilter::default()).unwrap();
+    // The header id is unusable for lookup; listing it would strand the
+    // session behind a "not found" error, so the file is skipped entirely.
+    assert!(l.is_empty(), "renamed file must not be listed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
