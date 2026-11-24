@@ -319,6 +319,9 @@ impl Builder {
             },
             parse_status: parse,
         });
+        if parse == ParseStatus::Partial {
+            self.report.partial_events += 1;
+        }
         self.report.parsed_events += 1;
     }
 
@@ -474,6 +477,7 @@ impl Builder {
         if truncated {
             for e in &mut self.events[before..] {
                 e.parse_status = ParseStatus::Partial;
+                self.report.partial_events += 1;
             }
             self.report.errors.push(format!(
                 "step {index}: fields truncated in source ({})",

@@ -172,3 +172,38 @@ fn ignores_virtual_uri_paths_for_file_change() {
         .collect();
     assert_eq!(changes, ["lib/main.dart"]);
 }
+
+#[test]
+fn renamed_session_file_with_mismatched_header_id_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("xmr-omp-rename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("-work-demo")).unwrap();
+    std::fs::write(
+        dir.join("-work-demo/2023-11-14T22-00-00-000Z_dddd3333-0000-0000-0000-000000000004.jsonl"),
+        "{\"type\":\"session\",\"version\":3,\"id\":\"eeee4444-0000-0000-0000-000000000005\",\"timestamp\":\"2023-11-14T22:00:00.000Z\",\"cwd\":\"/work/demo\"}\n",
+    )
+    .unwrap();
+    let a = OmpAdapter::new(dir.clone());
+    let err = a
+        .read_session("dddd3333-0000-0000-0000-000000000004")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("does not match requested id"),
+        "unexpected error: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn partial_events_are_counted_without_flagging_lossy() {
+    let a = adapter();
+    let s = a.read_session(A).unwrap();
+    assert!(
+        s.parse_report.partial_events > 0,
+        "model_change entries must be counted as partial"
+    );
+    assert!(
+        !s.parse_report.is_lossy(),
+        "partial content is exported, not skipped"
+    );
+}

@@ -5,6 +5,8 @@ pub mod agent;
 pub mod evidence;
 pub mod session;
 pub mod task;
+pub mod time;
+pub mod util;
 
 pub use adapter::{
     AdapterCapabilities, AdapterError, AdapterResult, AgentAdapter, AgentInstallation,
@@ -19,6 +21,8 @@ pub use session::{
     UnsupportedEvent,
 };
 pub use task::{Task, TaskState, TaskStatus};
+pub use time::millis_to_rfc3339;
+pub use util::is_uri_path;
 
 #[cfg(test)]
 mod tests {
@@ -93,6 +97,26 @@ mod tests {
         });
         assert!(r.is_lossy());
         assert_eq!(r.unsupported_events(), 1);
+    }
+
+    #[test]
+    fn parse_report_partial_count_and_serde_backcompat() {
+        let r = ParseReport {
+            partial_events: 3,
+            ..Default::default()
+        };
+        // Partial events keep their content in the export; they are not
+        // "skipped or failed", so they must not flip is_lossy().
+        assert!(!r.is_lossy());
+        // Reports serialised before the field existed still load.
+        let old = serde_json::json!({
+            "total_events": 3,
+            "parsed_events": 3,
+            "unsupported": [],
+            "errors": []
+        });
+        let r2: ParseReport = serde_json::from_value(old).unwrap();
+        assert_eq!(r2.partial_events, 0);
     }
 
     #[test]

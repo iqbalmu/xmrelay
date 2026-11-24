@@ -152,3 +152,32 @@ fn repository_state_json_is_redacted() {
     );
     assert!(rs.contains("[REDACTED:github_token]"));
 }
+
+#[test]
+fn drift_report_redacts_live_branch_name() {
+    let t = Tmp::new("drift-redact");
+    let repo = t.0.join("repo");
+    let store = t.0.join("store");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("a.txt"), "hello\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+
+    create_checkpoint(&repo, &store).unwrap();
+
+    // Move to a branch whose name is itself an AWS access key: the drift
+    // report must show the redacted form, never the raw key.
+    let key = format!("AKIA{}", "ABCDEFGHIJKLMNOP");
+    git(&repo, &["switch", "-q", "-c", &key]);
+    let drift = compare_with_workspace(&store, &latest_id(&store), None).unwrap();
+    let (old, new) = drift.branch_changed.expect("branch must differ");
+    assert_eq!(old.as_deref(), Some("main"));
+    assert_eq!(new.as_deref(), Some("[REDACTED:aws_access_key]"));
+}
+
+fn latest_id(store: &Path) -> String {
+    list_checkpoints(store, None).unwrap()[0]
+        .checkpoint_id
+        .clone()
+}

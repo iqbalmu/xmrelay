@@ -1,12 +1,12 @@
 //! Read-only OpenCode adapter. Source: `opencode.db` (SQLite), tables
 //! `session_v2` and `session_message`. Never writes to the database.
 
-mod time;
-
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use xmrelay_core::session::{EventSourceRef, ProjectRef, SessionSource, UnsupportedEvent};
+use xmrelay_core::time::millis_to_rfc3339;
+use xmrelay_core::util::is_uri_path;
 use xmrelay_core::{
     Actor, AdapterCapabilities, AdapterError, AdapterResult, AgentAdapter, AgentId, AgentInfo,
     AgentInstallation, Event, EventContent, EventKind, ParseReport, ParseStatus, Session,
@@ -111,7 +111,7 @@ impl AgentAdapter for OpenCodeAdapter {
                     agent: AgentId::OpenCode,
                     title: r.get(1)?,
                     project_root: r.get(2)?,
-                    updated_at: Some(time::millis_to_rfc3339(r.get(3)?)),
+                    updated_at: Some(millis_to_rfc3339(r.get(3)?)),
                     event_count: r.get::<_, i64>(4)? as u64,
                 })
             })
@@ -170,8 +170,20 @@ impl AgentAdapter for OpenCodeAdapter {
             report: ParseReport::default(),
         };
         for m in msgs {
-            let (id, typ, seq, ts, data) = m.map_err(src_err)?;
-            b.message(&id, &typ, seq as u64, ts, &data);
+            let (id, typ, seq, ts, data) = match m {
+                Ok(row) => row,
+                Err(e) => {
+                    // One unreadable row must not abort the whole session
+                    // read; record it and continue (same policy as
+                    // list_sessions, and the report keeps the failure visible).
+                    b.report.total_events += 1;
+                    b.report
+                        .errors
+                        .push(format!("unreadable session_message row: {e}"));
+                    continue;
+                }
+            };
+            b.message(&id, &typ, seq.max(0) as u64, ts, &data);
         }
 
         Ok(Session {
@@ -190,8 +202,8 @@ impl AgentAdapter for OpenCodeAdapter {
                 repository: Path::new(&directory).join(".git").exists(),
                 root: directory,
             }),
-            started_at: Some(time::millis_to_rfc3339(created)),
-            updated_at: Some(time::millis_to_rfc3339(updated)),
+            started_at: Some(millis_to_rfc3339(created)),
+            updated_at: Some(millis_to_rfc3339(updated)),
             events: b.events,
             parse_report: b.report,
         })
@@ -230,7 +242,7 @@ impl Builder {
         self.events.push(Event {
             id: format!("{}:{}", self.session_id, sequence),
             sequence,
-            timestamp: Some(time::millis_to_rfc3339(ts)),
+            timestamp: Some(millis_to_rfc3339(ts)),
             kind,
             actor,
             content,
@@ -242,6 +254,9 @@ impl Builder {
             },
             parse_status: parse,
         });
+        if parse == ParseStatus::Partial {
+            self.report.partial_events += 1;
+        }
         self.report.parsed_events += 1;
     }
 
@@ -319,8 +334,8 @@ impl Builder {
                 );
             }
             "idle" => {
-                self.report.total_events += 1;
                 if let Some(err) = v.get("error") {
+                    self.report.total_events += 1;
                     let msg = err["message"].as_str().map(String::from);
                     let structured = Some(json!({ "type": err["type"], "outcome": v["outcome"] }));
                     self.push(
@@ -336,9 +351,9 @@ impl Builder {
                         ToolStatus::Unknown,
                         ParseStatus::Parsed,
                     );
-                } else {
-                    self.report.parsed_events += 1;
                 }
+                // An idle marker without an error carries no transferable
+                // content; it is not counted, matching hidden "reasoning".
             }
             "agent-switched" | "model-switched" => {
                 self.report.total_events += 1;
@@ -497,16 +512,6 @@ impl Builder {
             }
         }
     }
-}
-
-fn is_uri_path(path: &str) -> bool {
-    let Some((scheme, _)) = path.split_once("://") else {
-        return false;
-    };
-    !scheme.is_empty()
-        && scheme
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
 fn extract_opencode_file_paths(tool_name: &str, inp: &Value) -> Vec<String> {

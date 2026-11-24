@@ -152,3 +152,28 @@ fn missing_session_and_missing_db() {
     assert!(!missing.detect().unwrap().available);
     assert!(missing.list_sessions(&SessionFilter::default()).is_err());
 }
+
+#[test]
+fn corrupt_row_is_skipped_and_recorded_not_fatal() {
+    let sql = include_str!("../../../../fixtures/opencode/basic.sql");
+    let dir = tempdir::Dir::new();
+    let path = dir.path().join("opencode.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(sql).unwrap();
+    // A row whose `data` column is a BLOB: schema drift the adapter cannot
+    // decode. It must be recorded as a parse error, not abort the session.
+    conn.execute(
+        "INSERT INTO session_message VALUES ('m99','ses_1','user',99,1700000099000,1700000099000, X'00FF00')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let a = OpenCodeAdapter::new(path);
+    let s = a.read_session("ses_1").unwrap();
+    assert!(s
+        .parse_report
+        .errors
+        .iter()
+        .any(|e| e.contains("unreadable session_message row")));
+    assert!(s.parse_report.is_lossy());
+}

@@ -124,6 +124,7 @@ fn sample_session(root: &Path, written_file: &str, secret: &str) -> Session {
         parse_report: ParseReport {
             total_events: 3,
             parsed_events: 3,
+            partial_events: 0,
             unsupported: Vec::new(),
             errors: Vec::new(),
         },
@@ -475,6 +476,7 @@ fn context_accuracy_handles_in_session_rm_multiline_and_affirmative_reply() {
         parse_report: ParseReport {
             total_events: 9,
             parsed_events: 9,
+            partial_events: 0,
             unsupported: Vec::new(),
             errors: Vec::new(),
         },
@@ -709,4 +711,37 @@ fn user_message_noise_filtered_and_deduped() {
         .unwrap();
     let bullets = section.lines().filter(|l| l.starts_with("- ")).count();
     assert_eq!(bullets, 1);
+}
+
+#[test]
+fn validate_blocks_when_git_repository_disappears() {
+    let t = Tmp::new("git-gone");
+    let repo = t.0.join("repo");
+    let store = t.0.join("store");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("src/auth.rs"), "pub fn auth() {}\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+
+    let sess = sample_session(&repo, "src/auth.rs", "no-secret");
+    let detail = create_handoff(&sess, AgentId::Omp, Some(&repo), &store).unwrap();
+    assert!(detail.manifest.git.is_repository);
+
+    // The whole repository vanishes (`rm -rf .git` or a move): the manifest
+    // still records branch + HEAD, so continuation must block instead of
+    // silently skipping every git comparison.
+    fs::remove_dir_all(repo.join(".git")).unwrap();
+    let reval = validate_handoff(&store, &detail.manifest.handoff_id, Some(&repo)).unwrap();
+    assert_eq!(reval.validation.status, PreflightStatus::Blocked);
+    assert!(reval
+        .validation
+        .conflicts
+        .iter()
+        .any(|c| { c.critical && c.description.contains("live workspace no longer has one") }));
+    assert!(reval
+        .validation
+        .checklist
+        .iter()
+        .any(|c| c.id == "CHK-03" && !c.checked));
 }

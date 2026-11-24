@@ -107,10 +107,13 @@ pub struct UnsupportedEvent {
 pub struct ParseReport {
     pub total_events: u64,
     pub parsed_events: u64,
+    /// Events exported as `ParseStatus::Partial`: their content was kept but
+    /// not every source field was mapped to the normalised model.
+    #[serde(default)]
+    pub partial_events: u64,
     pub unsupported: Vec<UnsupportedEvent>,
     pub errors: Vec<String>,
 }
-
 impl ParseReport {
     pub fn unsupported_events(&self) -> u64 {
         self.unsupported.len() as u64

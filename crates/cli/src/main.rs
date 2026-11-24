@@ -429,9 +429,10 @@ fn inspect(id: &str, agent: Option<String>, json: bool) -> Result<(), String> {
     );
     println!("events    {} normalised", s.events.len());
     println!(
-        "parse     total={} parsed={} unsupported={} errors={}",
+        "parse     total={} parsed={} partial={} unsupported={} errors={}",
         r.total_events,
         r.parsed_events,
+        r.partial_events,
         r.unsupported_events(),
         r.errors.len()
     );
@@ -1202,12 +1203,16 @@ fn release_target() -> Result<&'static str, String> {
     }
 }
 
-fn release_asset_url(version: &str, suffix: &str) -> String {
-    let asset = format!("xmrelay-{}{suffix}", release_target().unwrap_or_default());
+fn release_asset_url(version: &str, suffix: &str) -> Result<String, String> {
+    let asset = format!("xmrelay-{}{suffix}", release_target()?);
     if version == "latest" {
-        format!("https://github.com/iqbalmu/xmrelay/releases/latest/download/{asset}")
+        Ok(format!(
+            "https://github.com/iqbalmu/xmrelay/releases/latest/download/{asset}"
+        ))
     } else {
-        format!("https://github.com/iqbalmu/xmrelay/releases/download/{version}/{asset}")
+        Ok(format!(
+            "https://github.com/iqbalmu/xmrelay/releases/download/{version}/{asset}"
+        ))
     }
 }
 
@@ -1261,8 +1266,8 @@ fn update_cmd(version: &str) -> Result<(), String> {
 
     // Download the pinned release artifact and verify its published SHA-256
     // in-process. No remote script is ever executed.
-    let archive = curl_bytes(&release_asset_url(version, ".tar.gz"))?;
-    let sums = curl_bytes(&release_asset_url(version, ".tar.gz.sha256"))?;
+    let archive = curl_bytes(&release_asset_url(version, ".tar.gz")?)?;
+    let sums = curl_bytes(&release_asset_url(version, ".tar.gz.sha256")?)?;
     let expected = String::from_utf8_lossy(&sums)
         .lines()
         .next()

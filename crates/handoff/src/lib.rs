@@ -15,8 +15,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xmrelay_core::{
-    AgentId, Classification, Confidence, EventKind, Evidence, EvidenceItem, Session, SourceRef,
-    SourceType, Task, TaskState, TaskStatus, ToolStatus, Verification,
+    is_uri_path, millis_to_rfc3339, AgentId, Classification, Confidence, EventKind, Evidence,
+    EvidenceItem, Session, SourceRef, SourceType, Task, TaskState, TaskStatus, ToolStatus,
+    Verification,
 };
 use xmrelay_repository::{
     discover_instructions, inspect, redact_free_text, sha256_hex, tracked_patch, InstructionSet,
@@ -191,29 +192,6 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-fn millis_to_rfc3339(ms: i64) -> String {
-    let secs = ms.div_euclid(1000);
-    let milli = ms.rem_euclid(1000);
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{milli:03}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
 }
 
 /// Reserve a unique package directory atomically: `fs::create_dir` fails on an
@@ -479,16 +457,6 @@ fn is_agent_internal_artifact(display_path: &str) -> bool {
         || display_path.contains("/.local/share/xmrelay/")
         || display_path.contains("/.local/share/xm-relay/")
         || display_path.contains("/.local/share/opencode/")
-}
-
-fn is_uri_path(raw: &str) -> bool {
-    let Some((scheme, _)) = raw.split_once("://") else {
-        return false;
-    };
-    !scheme.is_empty()
-        && scheme
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
 fn resolve_file_in_root(root: &Path, raw: &str) -> ResolvedFile {
@@ -1012,6 +980,11 @@ fn extract_from_session(
             session.parse_report.unsupported_events(),
             session.parse_report.errors.len()
         ));
+    } else if session.parse_report.partial_events > 0 {
+        uncertainties.push(format!(
+            "{} session event(s) were partially parsed; some source fields were not mapped",
+            session.parse_report.partial_events
+        ));
     }
 
     // Ensure at least one pending continuation task (resolve short affirmative replies like "ya")
@@ -1105,9 +1078,13 @@ fn build_checklist(
         ChecklistItem {
             id: "CHK-03".into(),
             label: "Git branch and HEAD commit inspected".into(),
-            checked: !repo.is_repository || repo.head_commit.is_some() || repo.branch.is_some(),
+            checked: !manifest.git.is_repository
+                || repo.branch.is_some()
+                || repo.head_commit.is_some(),
             detail: format!(
-                "branch={:?} head={:?}",
+                "manifest_repository={} live_repository={} branch={:?} head={:?}",
+                manifest.git.is_repository,
+                repo.is_repository,
                 repo.branch,
                 repo.head_commit.as_deref().map(|h| &h[..h.len().min(8)])
             ),
@@ -1754,6 +1731,25 @@ pub fn validate_handoff(
     let mut conflicts = manifest.conflicts.clone();
     let mut warnings = manifest.warnings.clone();
 
+    // Repository presence is itself part of the handoff contract: losing the
+    // repository entirely must block continuation, not silently skip every
+    // git comparison below.
+    if manifest.git.is_repository && !live_repo.is_repository {
+        conflicts.push(ConflictItem {
+            id: format!("C-LIVE-{}", conflicts.len() + 1),
+            kind: ConflictKind::RepositoryConflict,
+            critical: true,
+            description:
+                "Handoff was created inside a Git repository, but the live workspace no longer has one"
+                    .into(),
+            evidence_ref: None,
+        });
+    } else if !manifest.git.is_repository && live_repo.is_repository {
+        warnings.push(
+            "workspace became a Git repository after the handoff was created; its repository context was not captured"
+                .into(),
+        );
+    }
     if manifest.git.is_repository && live_repo.is_repository {
         if manifest.git.branch != live_repo.branch {
             conflicts.push(ConflictItem {

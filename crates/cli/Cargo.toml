@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Local-first, cross-agent CLI tool for verifiable AI coding session handoffs"
 
 [[bin]]

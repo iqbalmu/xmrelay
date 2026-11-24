@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+xmrelay-core.workspace = true
 xmrelay-repository.workspace = true
 xmrelay-security.workspace = true
 serde = { version = "1", features = ["derive"] }

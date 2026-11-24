@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use xmrelay_core::session::{EventSourceRef, ProjectRef, SessionSource, UnsupportedEvent};
+use xmrelay_core::util::is_uri_path;
 use xmrelay_core::{
     Actor, AdapterCapabilities, AdapterError, AdapterResult, AgentAdapter, AgentId, AgentInfo,
     AgentInstallation, Event, EventContent, EventKind, ParseReport, ParseStatus, Session,
@@ -179,6 +180,16 @@ impl AgentAdapter for OmpAdapter {
             }
             let typ = v["type"].as_str().unwrap_or("");
             if typ == "session" {
+                // File names carry the id; a header that disagrees means the
+                // file was renamed or copied, and exporting it under the
+                // requested id would mislabel every event.
+                if v["id"].as_str().is_some_and(|h| h != session_id) {
+                    return Err(AdapterError::UnsupportedFormat(format!(
+                        "session header id '{}' does not match requested id '{session_id}' in {}",
+                        v["id"].as_str().unwrap_or_default(),
+                        path.display()
+                    )));
+                }
                 cwd = v["cwd"].as_str().map(String::from);
                 started = v["timestamp"].as_str().map(String::from);
                 fmt_version = v["version"].as_i64().map(|n| n.to_string());
@@ -259,6 +270,9 @@ impl Builder {
             },
             parse_status: parse,
         });
+        if parse == ParseStatus::Partial {
+            self.report.partial_events += 1;
+        }
         self.report.parsed_events += 1;
     }
 
@@ -577,17 +591,6 @@ impl Builder {
             }
         }
     }
-}
-
-/// Returns true for virtual/tool URI paths like `xd://mcp__dart_dtd`.
-fn is_uri_path(path: &str) -> bool {
-    let Some((scheme, _)) = path.split_once("://") else {
-        return false;
-    };
-    !scheme.is_empty()
-        && scheme
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
 /// Joins text blocks of a content value (string or block array).

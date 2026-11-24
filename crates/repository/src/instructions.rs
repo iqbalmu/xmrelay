@@ -3,8 +3,10 @@
 //! Content is untrusted data (spec 16.4): it is recorded with provenance and never
 //! executed or treated as instructions for this tool. Symlinks are not followed.
 
-use crate::{repo_root, sha256_hex};
+use crate::repo_root;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const MAX_CONTENT_BYTES: u64 = 256 * 1024;
@@ -181,33 +183,74 @@ fn read_file(
     if f.is_symlink {
         set.warnings
             .push(format!("{path} is a symlink and was not followed"));
-    } else if !meta.is_file() {
-        set.warnings.push(format!("{path} is not a regular file"));
     } else {
-        match std::fs::read(p) {
-            Ok(bytes) => {
-                f.sha256 = Some(sha256_hex(&bytes));
-                f.truncated = meta.len() > MAX_CONTENT_BYTES;
-                let cut = &bytes[..bytes.len().min(MAX_CONTENT_BYTES as usize)];
-                match std::str::from_utf8(cut) {
-                    Ok(s) => f.content = Some(s.to_string()),
-                    // A cut inside a multi-byte char is fine; anything else is not text.
-                    Err(e) if f.truncated && e.error_len().is_none() => {
-                        f.content =
-                            Some(String::from_utf8_lossy(&cut[..e.valid_up_to()]).into_owned())
+        // Open first and stat the descriptor: size, truncation flag, hash, and
+        // exported bytes must all describe the same file even if the path is
+        // replaced between the checks. Reads stop at MAX_CONTENT_BYTES (+1 to
+        // detect the cut) so a huge instruction file cannot inflate memory;
+        // the hash still covers the whole file.
+        match std::fs::File::open(p) {
+            Ok(mut file) => match file.metadata() {
+                Ok(open_meta) if !open_meta.is_file() => {
+                    set.warnings.push(format!("{path} is not a regular file"));
+                }
+                Ok(open_meta) => {
+                    f.size = open_meta.len();
+                    let mut hasher = Sha256::new();
+                    let mut content = Vec::new();
+                    let read = (&mut file)
+                        .take(MAX_CONTENT_BYTES + 1)
+                        .read_to_end(&mut content);
+                    match read {
+                        Ok(_) => {
+                            hasher.update(&content);
+                            f.truncated = content.len() > MAX_CONTENT_BYTES as usize;
+                            if f.truncated {
+                                let mut chunk = [0u8; 64 * 1024];
+                                loop {
+                                    match file.read(&mut chunk) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => hasher.update(&chunk[..n]),
+                                    }
+                                }
+                                content.truncate(MAX_CONTENT_BYTES as usize);
+                            }
+                            f.sha256 = Some(hex(&hasher.finalize()));
+                            match std::str::from_utf8(&content) {
+                                Ok(s) => f.content = Some(s.to_string()),
+                                // A cut inside a multi-byte char is fine; anything else is not text.
+                                Err(e) if f.truncated && e.error_len().is_none() => {
+                                    f.content = Some(
+                                        String::from_utf8_lossy(&content[..e.valid_up_to()])
+                                            .into_owned(),
+                                    )
+                                }
+                                Err(_) => set
+                                    .warnings
+                                    .push(format!("{path} is not valid UTF-8; content omitted")),
+                            }
+                            if f.truncated {
+                                set.warnings.push(format!(
+                                    "{path} exceeds {MAX_CONTENT_BYTES} bytes; content truncated"
+                                ));
+                            }
+                        }
+                        Err(e) => set.warnings.push(format!("cannot read {path}: {e}")),
                     }
-                    Err(_) => set
-                        .warnings
-                        .push(format!("{path} is not valid UTF-8; content omitted")),
                 }
-                if f.truncated {
-                    set.warnings.push(format!(
-                        "{path} exceeds {MAX_CONTENT_BYTES} bytes; content truncated"
-                    ));
-                }
-            }
+                Err(e) => set.warnings.push(format!("cannot stat {path}: {e}")),
+            },
             Err(e) => set.warnings.push(format!("cannot read {path}: {e}")),
         }
     }
     set.files.push(f);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }

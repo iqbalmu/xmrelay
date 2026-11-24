@@ -10,8 +10,12 @@ pub use instructions::{discover_instructions, InstructionFile, InstructionKind, 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Untracked files above this size are listed but not hashed.
 const MAX_HASH_BYTES: u64 = 5 * 1024 * 1024;
@@ -23,7 +27,15 @@ const RECENT_COMMITS: usize = 10;
 #[derive(Debug)]
 pub enum RepoError {
     GitUnavailable(String),
-    GitFailed { args: String, stderr: String },
+    GitFailed {
+        args: String,
+        stderr: String,
+    },
+    /// The invocation exceeded the deadline and was killed.
+    GitTimedOut {
+        args: String,
+        secs: u64,
+    },
     Parse(String),
 }
 
@@ -32,6 +44,9 @@ impl fmt::Display for RepoError {
         match self {
             Self::GitUnavailable(m) => write!(f, "git is not available: {m}"),
             Self::GitFailed { args, stderr } => write!(f, "git {args} failed: {}", stderr.trim()),
+            Self::GitTimedOut { args, secs } => {
+                write!(f, "git {args} timed out after {secs}s and was killed")
+            }
             Self::Parse(m) => write!(f, "could not parse git output: {m}"),
         }
     }
@@ -142,25 +157,122 @@ pub struct RepositoryState {
     pub warnings: Vec<String>,
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, RepoError> {
-    let out = Command::new("git")
-        .arg("-C")
+/// Upper bound for one git invocation before it is killed. Repo-local hooks
+/// or a pathological repository must not be able to hang the CLI forever.
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
-        .args(["--no-pager", "-c", "core.quotepath=off"])
+        // The -c overrides neutralise repo-local configuration: quotepath
+        // mangles non-ASCII paths, and core.fsmonitor spawns a background
+        // daemon that both runs repo-configured code and writes into .git
+        // (breaking the read-only contract). GIT_OPTIONAL_LOCKS=0 below stops
+        // `git status` from rewriting the index.
+        .args([
+            "--no-pager",
+            "-c",
+            "core.quotepath=off",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// Read a child pipe to EOF (or `cap` bytes), publishing the running length so
+/// the supervisor can detect a hit cap without joining.
+fn drain(
+    rd: Option<impl Read + Send + 'static>,
+    cap: Option<u64>,
+    count: Arc<AtomicUsize>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let Some(mut rd) = rd else { return buf };
+        let mut chunk = [0u8; 64 * 1024];
+        let mut limited = (&mut rd).take(cap.unwrap_or(u64::MAX));
+        loop {
+            match limited.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    count.store(buf.len(), Ordering::Relaxed);
+                }
+            }
+        }
+        buf
+    })
+}
+
+/// Run git with piped stdio, draining both pipes on worker threads (a full
+/// pipe can never deadlock the child), enforcing `GIT_TIMEOUT`, and optionally
+/// capping stdout at `cap` bytes. Returns `(stdout, stderr, stdout_truncated)`:
+/// when the cap is hit the child is killed instead of being left to write
+/// output nobody will read.
+fn run_git(
+    dir: &Path,
+    args: &[&str],
+    stdout_cap: Option<u64>,
+) -> Result<(Vec<u8>, Vec<u8>, bool), RepoError> {
+    let mut child = git_command(dir, args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| RepoError::GitUnavailable(e.to_string()))?;
-    if out.status.success() {
-        Ok(out.stdout)
-    } else {
-        Err(RepoError::GitFailed {
-            args: args.join(" "),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+    let out_count = Arc::new(AtomicUsize::new(0));
+    let out_thread = drain(child.stdout.take(), stdout_cap, out_count.clone());
+    let err_thread = drain(child.stderr.take(), None, Arc::new(AtomicUsize::new(0)));
+
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| RepoError::GitUnavailable(e.to_string()))?
+        {
+            Some(status) => {
+                let stdout = out_thread.join().unwrap_or_default();
+                let stderr = err_thread.join().unwrap_or_default();
+                if status.success() {
+                    return Ok((stdout, stderr, false));
+                }
+                return Err(RepoError::GitFailed {
+                    args: args.join(" "),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                });
+            }
+            None => {
+                // `take(cap)` reads at most `cap` bytes, so the count only
+                // reaches the cap when the output exceeded it.
+                if stdout_cap.is_some_and(|cap| out_count.load(Ordering::Relaxed) >= cap as usize) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stdout = out_thread.join().unwrap_or_default();
+                    let stderr = err_thread.join().unwrap_or_default();
+                    return Ok((stdout, stderr, true));
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RepoError::GitTimedOut {
+                        args: args.join(" "),
+                        secs: GIT_TIMEOUT.as_secs(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
+}
+
+fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, RepoError> {
+    let (stdout, _stderr, _truncated) = run_git(dir, args, None)?;
+    Ok(stdout)
 }
 
 fn git_text(dir: &Path, args: &[&str]) -> Result<String, RepoError> {
@@ -403,21 +515,44 @@ fn hash_untracked(root: &Path, st: &mut RepositoryState) {
         if f.is_symlink {
             continue; // never follow symlinks (spec 16.3)
         }
-        if !meta.is_file() {
+        // Open first, then stat the descriptor, so the type/size checks and
+        // the bytes hashed describe the same file even if the path is
+        // replaced in between: a swapped-in symlink target or device is
+        // caught by the `is_file()` check on the descriptor's own metadata.
+        // (Residual race: a FIFO swapped in between stat and open can still
+        // block in open(2); closing that needs O_NONBLOCK, which std does
+        // not expose portably.)
+        let Ok(mut file) = std::fs::File::open(&p) else {
+            warnings.push(format!("cannot read untracked file: {}", f.path));
+            continue;
+        };
+        let Ok(open_meta) = file.metadata() else {
+            warnings.push(format!("cannot stat untracked file: {}", f.path));
+            continue;
+        };
+        f.size = Some(open_meta.len());
+        if !open_meta.is_file() {
             // FIFOs block on read until a writer appears; sockets error. Skip
             // both so a stray pipe in the workspace cannot hang inspection.
             warnings.push(format!("untracked special file not hashed: {}", f.path));
             continue;
         }
-        if meta.len() > MAX_HASH_BYTES {
+        if open_meta.len() > MAX_HASH_BYTES {
             warnings.push(format!(
                 "untracked file not hashed (over {MAX_HASH_BYTES} bytes): {}",
                 f.path
             ));
             continue;
         }
-        match std::fs::read(&p) {
-            Ok(bytes) => f.sha256 = Some(sha256_hex(&bytes)),
+        // Cap the read as well: the file may grow after the stat above.
+        let mut buf = Vec::new();
+        let read = (&mut file).take(MAX_HASH_BYTES + 1).read_to_end(&mut buf);
+        match read {
+            Ok(_) if buf.len() > MAX_HASH_BYTES as usize => warnings.push(format!(
+                "untracked file not hashed (over {MAX_HASH_BYTES} bytes): {}",
+                f.path
+            )),
+            Ok(_) => f.sha256 = Some(sha256_hex(&buf)),
             Err(e) => warnings.push(format!("cannot read untracked file {}: {e}", f.path)),
         }
     }
@@ -425,10 +560,12 @@ fn hash_untracked(root: &Path, st: &mut RepositoryState) {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in Sha256::digest(bytes) {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Binary-safe patch of all tracked changes (staged and unstaged) relative to HEAD.
@@ -443,7 +580,11 @@ pub fn tracked_patch(root: &Path) -> Result<Vec<u8>, RepoError> {
         "--no-renames",
     ];
     args.push(if has_head { "HEAD" } else { "--cached" });
-    git(root, &args)
+    // Stream stdout through a byte cap so a repository with multi-GB binary
+    // churn cannot exhaust memory: at most MAX_PATCH_BYTES + 1 bytes are
+    // buffered and callers detect truncation via len > MAX_PATCH_BYTES.
+    let (stdout, _stderr, _truncated) = run_git(root, &args, Some(MAX_PATCH_BYTES as u64 + 1))?;
+    Ok(stdout)
 }
 
 /// Top-level directory of the repository containing `path`, if any.
