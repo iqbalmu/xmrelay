@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "xmrelay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "xmrelay-adapter-antigravity"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "xmrelay-adapter-omp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "xmrelay-core",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "xmrelay-adapter-opencode"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "xmrelay-checkpoint"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "xmrelay-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "xmrelay-handoff"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "xmrelay-repository"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "sha2",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "xmrelay-security"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "regex",
  "serde",
